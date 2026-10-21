@@ -1,0 +1,6 @@
+# Install torch + torchvision together so their versions match.
+torch>=2.6,<3
+torchvision>=0.21,<1
+numpy>=1.26,<3
+Pillow>=10,<13
+opencv-python-headless>=4.8,<5

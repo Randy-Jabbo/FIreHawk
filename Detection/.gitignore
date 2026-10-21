@@ -1,0 +1,11 @@
+# Dataset folders
+data/
+254p Thermal Images/
+254p RGB Images/
+
+# Dataset archives
+*.zip
+
+# Training outputs
+runs/
+*.pt
