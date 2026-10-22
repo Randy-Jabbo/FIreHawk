@@ -15,6 +15,29 @@ The five scripts are:
 | `test.py` | Measure performance on held-out images. |
 | `main.py` | Predict from one thermal image, a thermal video, or USB video capture. |
 
+## Edit settings and run
+
+Each runnable script has a `SETTINGS` dictionary near the top. Change its values,
+save the file, then run the script with no command-line arguments. Relative paths
+start in the folder containing these scripts, even if your terminal is elsewhere.
+You can also use absolute paths such as `"/Users/yourname/Downloads/thermal"`.
+
+For your layout, keep `254p Thermal Images` beside `preprocess.py` inside
+`Detection`. Run these in order:
+
+```bash
+python preprocess.py
+python train.py
+python test.py
+python main.py
+```
+
+The first three prepare data, train, and evaluate. Before running `main.py`, set
+its `"source"` to `"image"`, `"video"`, or `"camera"`, and edit the corresponding
+path/device. The default is an image named `254p Thermal Images/13701.jpg`; change
+that value if your actual filename is different. `model.py` defines the network
+and normally does not need editing.
+
 ## 1. Install
 
 Use Python 3.11 or 3.12. These scripts were checked with Python 3.12. On the Pi,
@@ -38,7 +61,7 @@ python -m pip install -r requirements.txt
 ```
 
 `opencv-python-headless` supports image/video capture without a desktop window.
-For `--display` on a desktop, replace it rather than installing both variants:
+For `"display": True` on a desktop, replace it rather than installing both variants:
 
 ```bash
 python -m pip uninstall -y opencv-python-headless
@@ -72,7 +95,7 @@ every positive thermal frame. Audit thermal examples and validate on your own
 thermal-only labels before drawing conclusions about camera performance.
 
 ```bash
-python preprocess.py --data-dir "/path/to/254p Thermal Images" --output-dir data/prepared --verify-images
+python preprocess.py
 ```
 
 This writes `train.csv`, `val.csv`, `test.csv`, and `dataset_summary.json`.
@@ -88,20 +111,20 @@ contains related footage from one burn, so these splits do not demonstrate
 performance on a new location, new fire, or NAJA camera. They also do not provide
 a smoke-only negative class.
 
-For a tiny development subset, a smaller `--gap-frames` may be necessary to keep
+For a tiny development subset, a smaller `SETTINGS["gap_frames"]` may be necessary to keep
 both classes in every split. Use the default gap for the full dataset.
 
 ## 3. Train
 
 ```bash
-python train.py --data-dir data/prepared --output-dir runs/firehawk --epochs 25 --batch-size 32
+python train.py
 ```
 
-The first run downloads ImageNet starting weights. `--no-pretrained` avoids that
+The first run downloads ImageNet starting weights. Setting `"pretrained": False` avoids that
 download, but training from scratch usually needs more data. The script uses
 class-weighted binary cross-entropy, horizontal flips, and early stopping. It
 selects `best.pt` by validation balanced accuracy; it never evaluates test images
-during training. Reduce `--batch-size` if GPU memory runs out.
+during training. Reduce `SETTINGS["batch_size"]` if GPU memory runs out.
 
 Outputs: `best.pt`, `history.csv`, `training_config.json`, and
 `best_validation.json`. The checkpoint includes the image preprocessing and
@@ -122,7 +145,7 @@ pseudocolor image gray does not reconstruct the original temperature values.
 ## 4. Evaluate on the held-out set
 
 ```bash
-python test.py --checkpoint runs/firehawk/best.pt --manifest data/prepared/test.csv
+python test.py
 ```
 
 Read `fire_recall` (how many fire frames were caught), `fire_precision` (how many
@@ -140,16 +163,17 @@ On the Pi, copy this folder and your trained `best.pt`, install dependencies,
 and start with a saved thermal image:
 
 ```bash
-python main.py --checkpoint runs/firehawk/best.pt --image thermal_frame.jpg
+python main.py
 ```
 
 The JSON output includes `fire_detected`, `label`, `fire_score`, and `model_ms`.
 `model_ms` measures the model call, not complete capture-to-result latency.
 
-For a recorded thermal video:
+For a recorded thermal video, edit these values in `main.py` and run it again:
 
-```bash
-python main.py --checkpoint runs/firehawk/best.pt --video thermal_recording.mp4
+```python
+"source": "video",
+"video": "thermal_recording.mp4",
 ```
 
 For the TC256, this implementation expects its **thermal video output** to reach
@@ -158,22 +182,26 @@ as a video device. The NAJA camera is not assumed to be a native USB webcam or
 CSI camera. Check the exact module pinout, output selection, PAL compatibility,
 adapter driver, and power requirements before connecting it.
 
-```bash
-python main.py --checkpoint runs/firehawk/best.pt --camera 0 --rate 5
+Set these values in `main.py`, then run `python main.py`:
+
+```python
+"source": "camera",
+"camera": 0,
+"rate": 5.0,
 ```
 
-Or use `--camera /dev/video0`. Capture dimensions can differ from the sensor's
+The camera setting can also be `"/dev/video0"` on Linux. Capture dimensions can differ from the sensor's
 256 x 192 dimensions because analog capture produces a video raster. Confirm
 that the feed contains the thermal image alone, with the intended palette. If
-the adapter feed contains borders or another view, use `--roi X Y W H` to select
+the adapter feed contains borders or another view, set `"roi": (X, Y, W, H)` to select
 the thermal area. Remove embedded overlays at the source when possible; a crop
 cannot remove an overlay covering useful scene pixels. Save the same thermal
 crop when collecting images for fine-tuning.
 
 The camera reader keeps the latest software frame instead of queuing old frames
-behind inference. `--rate 5` is a target, not a promised Pi frame rate. Camera
-errors produce an error, not a `no_fire` result. Ctrl+C stops capture. Add
-`--display` only with desktop OpenCV installed. No physical camera was available
+behind inference. `"rate": 5.0` is a target, not a promised Pi frame rate. Camera
+errors produce an error, not a `no_fire` result. Ctrl+C stops capture. Set
+`"display": True` only with desktop OpenCV installed. No physical camera was available
 for the automated checks.
 
 ## 6. Make it work with your actual NAJA camera
@@ -201,12 +229,17 @@ naja/session_f/frame001.jpg,fire,test
 This is a format example, not enough images to train a useful model. Once you
 have a representative labeled collection:
 
-```bash
-python preprocess.py --labels-csv naja_labels.csv --output-dir data/naja --verify-images
-python train.py --data-dir data/naja --init-checkpoint runs/firehawk/best.pt --output-dir runs/naja --lr 0.00001
-python test.py --checkpoint runs/naja/best.pt --manifest data/naja/test.csv --output-dir runs/naja_evaluation
-python main.py --checkpoint runs/naja/best.pt --camera 0 --rate 5
-```
+Change the settings in each script as follows:
+
+| Script | Settings to change |
+| --- | --- |
+| `preprocess.py` | `"labels_csv": "naja_labels.csv"`, `"output_dir": "data/naja"`. The CSV takes priority over `data_dir`. |
+| `train.py` | `"data_dir": "data/naja"`, `"init_checkpoint": "runs/firehawk/best.pt"`, `"output_dir": "runs/naja"`, `"lr": 0.00001`. |
+| `test.py` | `"checkpoint": "runs/naja/best.pt"`, `"manifest": "data/naja/test.csv"`, `"output_dir": "runs/naja_evaluation"`. |
+| `main.py` | `"checkpoint": "runs/naja/best.pt"`, `"source": "camera"`, `"camera": 0`. |
+
+Save each file and run `preprocess.py`, `train.py`, `test.py`, and `main.py` in
+that order, with no command-line arguments.
 
 Fine-tuning inherits the original checkpoint's input size and preprocessing.
 Check performance on the held-out NAJA sessions at your required distances,
@@ -221,6 +254,9 @@ over all 53,451 original IDs, matching PIL/OpenCV preprocessing, checkpoint relo
 capture failure handling, and keeping the latest camera frame. Generated image
 fixtures exercised preprocessing, training from scratch, ImageNet initialization
 at the default 224 input size, evaluation, image/video predictions, and fine-tuning.
+The editable-settings version was also checked by running preprocessing, training,
+evaluation, and image/video predictions without command-line arguments, from a
+different working directory. A simulated capture checked camera-source selection.
 No FLAME 2 accuracy benchmark, physical NAJA test, or Pi performance test was run.
 
 ## Sources

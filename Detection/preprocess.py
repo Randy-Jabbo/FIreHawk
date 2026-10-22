@@ -1,11 +1,11 @@
 """Build labeled manifests and apply identical training/inference preprocessing."""
 
-import argparse
 import bisect
 import csv
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import random
 import re
 
@@ -13,6 +13,29 @@ import numpy as np
 from PIL import Image, ImageOps
 import torch
 from torch.utils.data import Dataset
+
+# EDIT THESE SETTINGS, then run: python preprocess.py
+# Relative paths start in the folder containing these scripts.
+SCRIPT_DIR = Path(__file__).resolve().parent
+SETTINGS = {
+    "data_dir": "254p Thermal Images",  # Your original FLAME 2 thermal folder.
+    "labels_csv": None,                # For your own labeled images, set a CSV path.
+                                      # When set, labels_csv takes priority over data_dir.
+    "output_dir": "data/prepared",
+    "val_fraction": 0.15,
+    "test_fraction": 0.15,
+    "gap_frames": 150,                 # Guard frames on EACH side of split boundaries.
+    "verify_images": True,
+}
+
+
+def script_path(value):
+    """Resolve an editable file/folder setting relative to this script folder."""
+    if value is None:
+        return None
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else SCRIPT_DIR / path
+
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 SPLITS = ("train", "val", "test")
@@ -34,29 +57,54 @@ def flame2_label(frame_id: int) -> int:
 
 
 def scan_flame2(folder: Path) -> list[dict]:
-    rows, seen = [], set()
+    rows = []
+    seen = set()
+
     if not folder.is_dir():
         raise ValueError(f"Thermal image directory does not exist: {folder}")
+
     for path in sorted(folder.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
-        numbers = re.findall(r"\d+", path.stem)
-        if len(numbers) != 1:
-            raise ValueError(
-                f"Cannot identify one original frame ID in {path.name!r}. "
-                "Use preserved FLAME 2 names or --labels-csv for other images."
-            )
-        frame_id = int(numbers[0])
+
+        # Original filename: 254p Thermal Frame (1).jpg
+        match = re.fullmatch(
+            r"254p\s+Thermal\s+Frame\s*\((\d+)\)",
+            path.stem,
+            flags=re.IGNORECASE,
+        )
+
+        if match:
+            frame_id = int(match.group(1))
+        else:
+            # Also allow names such as 1.jpg or frame_1.jpg.
+            numbers = re.findall(r"\d+", path.stem)
+
+            if len(numbers) != 1:
+                raise ValueError(
+                    f"Cannot identify the frame ID in {path.name!r}. "
+                    "Keep the original FLAME 2 filenames."
+                )
+
+            frame_id = int(numbers[0])
+
         if frame_id in seen:
             raise ValueError(
-                f"Duplicate frame ID {frame_id}. Point at the thermal folder only; "
-                "do not include both RGB and thermal images."
+                f"Duplicate frame ID {frame_id}. "
+                "Select only the thermal image folder."
             )
+
         seen.add(frame_id)
-        rows.append({"file": path.resolve(), "label": flame2_label(frame_id),
-                     "frame_id": frame_id})
+
+        rows.append({
+            "file": path.resolve(),
+            "label": flame2_label(frame_id),
+            "frame_id": frame_id,
+        })
+
     if not rows:
         raise ValueError(f"No supported images found in {folder}.")
+
     return sorted(rows, key=lambda row: row["frame_id"])
 
 
@@ -70,7 +118,7 @@ def chronological_split(rows, val_fraction=0.15, test_fraction=0.15, gap_frames=
             and val_fraction + test_fraction < 1):
         raise ValueError("Validation/test fractions must be positive and sum to less than 1.")
     if gap_frames < 0:
-        raise ValueError("--gap-frames must be nonnegative.")
+        raise ValueError("SETTINGS['gap_frames'] must be nonnegative.")
     assigned = []
     for label in (0, 1):
         group = sorted((r for r in rows if r["label"] == label),
@@ -131,7 +179,7 @@ def validate_rows(rows):
         if {r["label"] for r in rows if r["split"] == split} != {0, 1}:
             raise ValueError(
                 f"{split} needs both fire and no-fire images after applying the guard gap. "
-                "Use more data or a smaller --gap-frames for a small development subset."
+                "Use more data or a smaller SETTINGS['gap_frames'] for a small development subset."
             )
 
 
@@ -215,36 +263,31 @@ class ThermalDataset(Dataset):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--data-dir", type=Path, help="Original 254p Thermal Images folder only")
-    source.add_argument("--labels-csv", type=Path, help="Own images with explicit file,label,split")
-    parser.add_argument("--output-dir", type=Path, default=Path("data/prepared"))
-    parser.add_argument("--val-fraction", type=float, default=0.15)
-    parser.add_argument("--test-fraction", type=float, default=0.15)
-    parser.add_argument("--gap-frames", type=int, default=150,
-                        help="Discard this many frame IDs on EACH side of a split boundary")
-    parser.add_argument("--verify-images", action="store_true", help="Decode every image now")
-    args = parser.parse_args()
-    if args.data_dir:
-        original = scan_flame2(args.data_dir)
-        rows, discarded = chronological_split(original, args.val_fraction,
-                                               args.test_fraction, args.gap_frames)
+    settings = SimpleNamespace(**SETTINGS)
+    settings.labels_csv = script_path(settings.labels_csv)
+    settings.data_dir = None if settings.labels_csv is not None else script_path(settings.data_dir)
+    settings.output_dir = script_path(settings.output_dir)
+    if settings.labels_csv is None and settings.data_dir is None:
+        raise ValueError("Set SETTINGS['data_dir'] or SETTINGS['labels_csv'].")
+    if settings.data_dir:
+        original = scan_flame2(settings.data_dir)
+        rows, discarded = chronological_split(original, settings.val_fraction,
+                                               settings.test_fraction, settings.gap_frames)
         source_name = "FLAME2_original_254p_global_frame_ids"
     else:
-        rows = read_manual_labels(args.labels_csv.resolve())
+        rows = read_manual_labels(settings.labels_csv.resolve())
         discarded, source_name = 0, "manual_session_splits"
-    if args.verify_images:
+    if settings.verify_images:
         for row in rows:
             with Image.open(row["file"]) as image:
                 image.load()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
     summary = {"source": source_name, "discarded_boundary_frames": discarded,
-               "gap_frames_each_side": args.gap_frames if args.data_dir else None,
+               "gap_frames_each_side": settings.gap_frames if settings.data_dir else None,
                "class_names": {"0": "no_fire", "1": "fire"}, "splits": {}}
     for split in SPLITS:
         selected = [row for row in rows if row["split"] == split]
-        path = args.output_dir / f"{split}.csv"
+        path = settings.output_dir / f"{split}.csv"
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=["file", "label", "frame_id"])
             writer.writeheader()
@@ -255,7 +298,7 @@ def main():
             "no_fire": sum(row["label"] == 0 for row in selected),
             "fire": sum(row["label"] == 1 for row in selected),
         }
-    (args.output_dir / "dataset_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    (settings.output_dir / "dataset_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
     print("Prepared CSV manifests. Images were not copied or permanently resized.")
 

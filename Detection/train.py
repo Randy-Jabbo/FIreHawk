@@ -1,9 +1,9 @@
 """Train a thermal-only fire/no-fire model; reserve test.csv for test.py."""
 
-import argparse
 import csv
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import random
 import time
 
@@ -14,7 +14,27 @@ from torch.utils.data import DataLoader
 
 from model import ThermalFireClassifier, binary_metrics, choose_device, load_checkpoint, save_checkpoint
 from preprocess import (DEFAULT_CONFIG, ThermalDataset, read_manifest,
-                        validate_manifest_splits)
+                        validate_manifest_splits, script_path)
+
+
+# EDIT THESE SETTINGS, then run: python train.py
+# Relative paths start in the folder containing these scripts.
+SETTINGS = {
+    "data_dir": "data/prepared",
+    "output_dir": "runs/firehawk",
+    "epochs": 25,
+    "batch_size": 32,
+    "image_size": 224,
+    "lr": 0.0001,
+    "patience": 5,
+    "workers": 0,            # Increase to 2-4 on a training computer if useful.
+    "threads": 4,
+    "device": "auto",        # "auto", "cpu", "cuda", or "mps".
+    "seed": 42,
+    "threshold": None,       # None = 0.5, or inherit when fine-tuning.
+    "pretrained": True,      # Download/use ImageNet starting weights.
+    "init_checkpoint": None, # Set "runs/firehawk/best.pt" to fine-tune on NAJA data.
+}
 
 
 def seed_worker(worker_id):
@@ -47,75 +67,62 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, default=Path("data/prepared"))
-    parser.add_argument("--output-dir", type=Path, default=Path("runs/firehawk"))
-    parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--lr", type=float, default=0.0001)
-    parser.add_argument("--patience", type=int, default=5)
-    parser.add_argument("--workers", type=int, default=0, help="Increase to 2-4 on a training computer")
-    parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or mps")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--threshold", type=float, default=None,
-                        help="Default 0.5, or inherited from --init-checkpoint; choose using validation only")
-    parser.add_argument("--no-pretrained", action="store_true", help="Skip ImageNet download; usually worse")
-    parser.add_argument("--init-checkpoint", type=Path, help="Fine-tune a previous checkpoint on NAJA images")
-    args = parser.parse_args()
-    if (args.epochs < 1 or args.batch_size < 2 or args.image_size < 32
-            or args.lr <= 0 or args.patience < 1 or args.workers < 0 or args.threads < 1):
-        parser.error("Use positive settings, batch size >= 2, image size >= 32, workers >= 0.")
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.set_num_threads(args.threads)
-    device = choose_device(args.device)
-    manifests = {name: read_manifest(args.data_dir / f"{name}.csv")
+    settings = SimpleNamespace(**SETTINGS)
+    settings.data_dir = script_path(settings.data_dir)
+    settings.output_dir = script_path(settings.output_dir)
+    settings.init_checkpoint = script_path(settings.init_checkpoint)
+    if (settings.epochs < 1 or settings.batch_size < 2 or settings.image_size < 32
+            or settings.lr <= 0 or settings.patience < 1 or settings.workers < 0 or settings.threads < 1):
+        raise ValueError("Use positive settings, batch size >= 2, image size >= 32, workers >= 0.")
+    random.seed(settings.seed)
+    np.random.seed(settings.seed)
+    torch.manual_seed(settings.seed)
+    torch.set_num_threads(settings.threads)
+    device = choose_device(settings.device)
+    manifests = {name: read_manifest(settings.data_dir / f"{name}.csv")
                  for name in ("train", "val", "test")}
     validate_manifest_splits(manifests)
     # Only filenames/labels are checked for test overlap. No test images or scores
     # are used for model selection, class weighting, or threshold selection.
-    if args.init_checkpoint:
-        model, previous = load_checkpoint(args.init_checkpoint, device)
+    if settings.init_checkpoint:
+        model, previous = load_checkpoint(settings.init_checkpoint, device)
         config = previous["preprocessing"]
-        threshold = previous["threshold"] if args.threshold is None else args.threshold
+        threshold = previous["threshold"] if settings.threshold is None else settings.threshold
     else:
-        model = ThermalFireClassifier(pretrained=not args.no_pretrained).to(device)
-        config = {**DEFAULT_CONFIG, "image_size": args.image_size}
-        threshold = 0.5 if args.threshold is None else args.threshold
+        model = ThermalFireClassifier(pretrained=settings.pretrained).to(device)
+        config = {**DEFAULT_CONFIG, "image_size": settings.image_size}
+        threshold = 0.5 if settings.threshold is None else settings.threshold
     if not 0 < threshold < 1:
-        parser.error("--threshold must be between 0 and 1, exclusive.")
+        raise ValueError("SETTINGS['threshold'] must be between 0 and 1, exclusive.")
     if len(manifests["train"]) < 2:
-        parser.error("At least two training examples are required.")
+        raise ValueError("At least two training examples are required.")
     datasets = {name: ThermalDataset(manifests[name], config, augment=(name == "train"))
                 for name in ("train", "val")}
-    generator = torch.Generator().manual_seed(args.seed)
-    loaders = {name: DataLoader(dataset, batch_size=args.batch_size,
-                               shuffle=(name == "train"), num_workers=args.workers,
+    generator = torch.Generator().manual_seed(settings.seed)
+    loaders = {name: DataLoader(dataset, batch_size=settings.batch_size,
+                               shuffle=(name == "train"), num_workers=settings.workers,
                                worker_init_fn=seed_worker, generator=generator,
                                pin_memory=(device.type == "cuda"),
                                # BatchNorm cannot train on a final singleton at small sizes.
-                               drop_last=(name == "train" and len(dataset) % args.batch_size == 1))
+                               drop_last=(name == "train" and len(dataset) % settings.batch_size == 1))
                for name, dataset in datasets.items()}
     positives = sum(row["label"] for row in manifests["train"])
     negatives = len(manifests["train"]) - positives
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(negatives / positives, device=device))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0001)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=settings.lr, weight_decay=0.0001)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=2)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    settings = {key: str(value) if isinstance(value, Path) else value
-                for key, value in vars(args).items()}
-    (args.output_dir / "training_config.json").write_text(json.dumps(settings, indent=2) + "\n")
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    saved_settings = {key: str(value) if isinstance(value, Path) else value
+                      for key, value in vars(settings).items()}
+    (settings.output_dir / "training_config.json").write_text(json.dumps(saved_settings, indent=2) + "\n")
     print(f"Device: {device}; input: {config['image_size']} square; threshold: {threshold}", flush=True)
     print(f"Training classes: {negatives} no_fire, {positives} fire", flush=True)
     best_score, stale = -1.0, 0
     fields = ["epoch", "train_loss", "val_loss", "val_balanced_accuracy", "val_fire_recall", "val_fire_precision", "seconds"]
-    with (args.output_dir / "history.csv").open("w", newline="", encoding="utf-8") as handle:
+    with (settings.output_dir / "history.csv").open("w", newline="", encoding="utf-8") as handle:
         history = csv.DictWriter(handle, fieldnames=fields)
         history.writeheader()
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(1, settings.epochs + 1):
             started = time.perf_counter()
             train_loss, _, _ = run_epoch(model, loaders["train"], criterion, device, optimizer)
             val_loss, labels, scores = run_epoch(model, loaders["val"], criterion, device)
@@ -131,16 +138,16 @@ def main():
                   f"({seconds:.1f}s)", flush=True)
             if score > best_score:
                 best_score, stale = score, 0
-                save_checkpoint(args.output_dir / "best.pt", model, config, threshold,
+                save_checkpoint(settings.output_dir / "best.pt", model, config, threshold,
                                 {"epoch": epoch, "validation_metrics": metrics,
-                                 "seed": args.seed, "training_source": str(args.data_dir.resolve())})
-                (args.output_dir / "best_validation.json").write_text(json.dumps(metrics, indent=2) + "\n")
+                                 "seed": settings.seed, "training_source": str(settings.data_dir.resolve())})
+                (settings.output_dir / "best_validation.json").write_text(json.dumps(metrics, indent=2) + "\n")
             else:
                 stale += 1
-            if stale >= args.patience:
+            if stale >= settings.patience:
                 print("Early stopping: validation balanced accuracy stopped improving.", flush=True)
                 break
-    print(f"Saved best model: {args.output_dir / 'best.pt'}")
+    print(f"Saved best model: {settings.output_dir / 'best.pt'}")
     print("Next: evaluate once with test.py, then validate on separate NAJA recordings.")
 
 
